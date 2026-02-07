@@ -1,0 +1,128 @@
+pipeline
+{
+    agent any
+    
+    environment {
+        DOCKER_IMAGE = "eprasa4/abctechnologies"
+        KUBECONFIG_CREDENTIAL_ID = 'kubeconfig'
+        K8S_NAMESPACE = 'abc-ns'
+    }
+    
+    stages
+    {
+        stage('Checkout')
+        {
+            steps
+            {
+                git 'https://github.com/eprasa4/IGP_ABCTechnologies.git'
+            }
+        }
+        
+        stage('Compile')
+        {
+            steps
+            {
+                sh 'mvn compile'
+            }
+        }
+        
+        stage('Test')
+        {
+            steps
+            {
+                sh 'mvn test'
+            }
+        }
+        
+        stage('War package')
+        {
+            steps
+            {
+                sh 'mvn clean package'
+            }
+        }
+        
+        stage('Build Docker Image')
+        {
+            steps
+            {
+                sh 'cp /var/lib/jenkins/workspace/$JOB_NAME/target/ABCtechnologies*.war /var/lib/jenkins/workspace/$JOB_NAME/abctech.war'
+                sh 'docker build -t ${DOCKER_IMAGE}:${BUILD_NUMBER} .'
+                sh 'docker tag ${DOCKER_IMAGE}:${BUILD_NUMBER} ${DOCKER_IMAGE}:latest'
+            }
+        }
+        
+        stage('Push Docker Image')
+        { 
+            steps
+            {   
+                withDockerRegistry([ credentialsId: "mydockerhubcred", url: "" ])
+                {
+                    sh 'docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}'
+                    sh 'docker push ${DOCKER_IMAGE}:latest'
+                }
+            }
+        }
+        
+        stage('Deploy to Kubernetes')
+        {
+            steps
+            {
+                script {
+                    withKubeConfig([credentialsId: "${KUBECONFIG_CREDENTIAL_ID}"]) {
+                        
+                        // Create namespace if not exists
+                        sh """
+                            kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                        """
+                        
+                        // Apply Kubernetes manifests
+                        sh """
+                            kubectl apply -f k8s/deployment.yaml
+                            kubectl apply -f k8s/service.yaml
+                        """
+                        
+                        // Update deployment with new image
+                        sh """
+                            kubectl set image deployment/abctech-deployment \
+                            abctech-container=${DOCKER_IMAGE}:${BUILD_NUMBER} \
+                            -n ${K8S_NAMESPACE}
+                        """
+                        
+                        // Wait for rollout to complete
+                        sh """
+                            kubectl rollout status deployment/abctech-deployment -n ${K8S_NAMESPACE}
+                        """
+                        
+                        // Verify deployment
+                        sh """
+                            kubectl get pods -n ${K8S_NAMESPACE}
+                            kubectl get svc -n ${K8S_NAMESPACE}
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Cleanup Old Docker Images')
+        {
+            steps
+            {
+                sh """
+                    docker rmi ${DOCKER_IMAGE}:${BUILD_NUMBER} || true
+                    docker system prune -f
+                """
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo 'Deployment successful!'
+            echo "Application URL: http://<worker-node-ip>:30080"
+        }
+        failure {
+            echo 'Deployment failed!'
+        }
+    }
+}
